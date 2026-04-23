@@ -38,6 +38,15 @@ class UserModel:
     total_cost: float = 0.0
     message_count: int = 0
     session_count: int = 0
+    # Per-user TTS preferences (added in schema v5).
+    # Every user gets their own voice settings; defaults are conservative
+    # (opt-in, Hila/female, neutral rate/pitch, long_only mode).
+    tts_enabled: bool = False
+    tts_voice: str = "hila"          # "hila" | "avri"
+    tts_rate: str = "0%"             # edge-tts --rate (e.g. "-15%", "+10%")
+    tts_pitch: str = "0Hz"           # edge-tts --pitch (e.g. "-5Hz")
+    tts_mode: str = "long_only"      # "always" | "long_only" | "on_request"
+    tts_provider: str = "edge"       # reserved for future paid providers
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary."""
@@ -56,6 +65,16 @@ class UserModel:
         # Parse datetime fields
         for field in ["first_seen", "last_active"]:
             data[field] = _parse_datetime(data.get(field))
+
+        # Coerce integer tts_enabled to bool; tolerate missing columns for
+        # older schema snapshots (defensive — migrations normally add them).
+        if "tts_enabled" in data and data["tts_enabled"] is not None:
+            data["tts_enabled"] = bool(data["tts_enabled"])
+        else:
+            data.pop("tts_enabled", None)
+        for field in ("tts_voice", "tts_rate", "tts_pitch", "tts_mode", "tts_provider"):
+            if field in data and data[field] is None:
+                data.pop(field)
 
         return cls(**data)
 

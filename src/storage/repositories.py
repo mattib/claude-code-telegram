@@ -114,6 +114,76 @@ class UserRepository:
             rows = await cursor.fetchall()
             return [UserModel.from_row(row) for row in rows]
 
+    async def update_tts_prefs(
+        self,
+        user_id: int,
+        *,
+        enabled: Optional[bool] = None,
+        voice: Optional[str] = None,
+        rate: Optional[str] = None,
+        pitch: Optional[str] = None,
+        mode: Optional[str] = None,
+        provider: Optional[str] = None,
+    ) -> None:
+        """Partial update of a user's TTS preference columns.
+
+        Only fields passed explicitly are written. Callers should pass ``None``
+        for any dimension they don't want to modify.
+        """
+        fields: List[str] = []
+        params: List[object] = []
+        if enabled is not None:
+            fields.append("tts_enabled = ?")
+            params.append(1 if enabled else 0)
+        if voice is not None:
+            fields.append("tts_voice = ?")
+            params.append(voice)
+        if rate is not None:
+            fields.append("tts_rate = ?")
+            params.append(rate)
+        if pitch is not None:
+            fields.append("tts_pitch = ?")
+            params.append(pitch)
+        if mode is not None:
+            fields.append("tts_mode = ?")
+            params.append(mode)
+        if provider is not None:
+            fields.append("tts_provider = ?")
+            params.append(provider)
+
+        if not fields:
+            return
+
+        params.append(user_id)
+        query = f"UPDATE users SET {', '.join(fields)} WHERE user_id = ?"
+        async with self.db.get_connection() as conn:
+            await conn.execute(query, params)
+            await conn.commit()
+            logger.info(
+                "Updated TTS preferences",
+                user_id=user_id,
+                changed=[f.split(" ")[0] for f in fields],
+            )
+
+    async def reset_tts_prefs(self, user_id: int) -> None:
+        """Reset a user's TTS preferences to the schema defaults."""
+        async with self.db.get_connection() as conn:
+            await conn.execute(
+                """
+                UPDATE users
+                SET tts_enabled = 0,
+                    tts_voice = 'hila',
+                    tts_rate = '0%',
+                    tts_pitch = '0Hz',
+                    tts_mode = 'long_only',
+                    tts_provider = 'edge'
+                WHERE user_id = ?
+                """,
+                (user_id,),
+            )
+            await conn.commit()
+            logger.info("Reset TTS preferences", user_id=user_id)
+
 
 class SessionRepository:
     """Session data access."""

@@ -310,6 +310,21 @@ class DatabaseManager:
                     ON project_threads(project_slug);
                 """,
             ),
+            (
+                5,
+                """
+                -- Per-user TTS (text-to-speech) preferences.
+                -- Each user controls their own voice via /voice commands.
+                -- Defaults chosen for Hebrew-speaking user base (Hila = soft female).
+                ALTER TABLE users ADD COLUMN tts_enabled  INTEGER DEFAULT 0;
+                ALTER TABLE users ADD COLUMN tts_voice    TEXT    DEFAULT 'hila';
+                ALTER TABLE users ADD COLUMN tts_rate     TEXT    DEFAULT '0%';
+                ALTER TABLE users ADD COLUMN tts_pitch    TEXT    DEFAULT '0Hz';
+                ALTER TABLE users ADD COLUMN tts_mode     TEXT    DEFAULT 'long_only';
+                -- Forward-compat: reserved for future paid providers.
+                ALTER TABLE users ADD COLUMN tts_provider TEXT    DEFAULT 'edge';
+                """,
+            ),
         ]
 
     async def _init_pool(self):

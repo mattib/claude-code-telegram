@@ -242,6 +242,52 @@ class Settings(BaseSettings):
             "Named models resolve to ~/.cache/whisper-cpp/ggml-{name}.bin"
         ),
     )
+
+    # TTS (text-to-speech) output — per-user prefs live on the `users` table.
+    # These are global *defaults/feature-flags* only.
+    enable_tts_output: bool = Field(
+        False,
+        description=(
+            "Global feature flag: allow users to enable TTS for bot replies "
+            "via /voice command. When False, /voice returns a disabled notice."
+        ),
+    )
+    tts_default_voice: Literal["hila", "avri"] = Field(
+        "hila",
+        description="Default Edge TTS voice for new users (he-IL-*).",
+    )
+    tts_default_rate: str = Field(
+        "0%",
+        description="Default speaking rate (edge-tts --rate, e.g. '-10%', '+5%').",
+    )
+    tts_default_pitch: str = Field(
+        "0Hz",
+        description="Default pitch offset (edge-tts --pitch, e.g. '-5Hz').",
+    )
+    tts_default_mode: Literal["always", "long_only", "on_request"] = Field(
+        "long_only",
+        description=(
+            "When to speak replies by default: 'always', 'long_only' "
+            "(messages >200 chars), or 'on_request' (trigger emoji/keyword)."
+        ),
+    )
+    tts_cache_dir: Optional[Path] = Field(
+        None,
+        description=(
+            "Directory for cached synthesized audio clips. "
+            "Defaults to {approved_directory}/.tts_cache when unset."
+        ),
+    )
+    tts_cache_max_bytes: int = Field(
+        500 * 1024 * 1024,
+        description="Soft cap on TTS cache size in bytes (LRU eviction).",
+        ge=1024 * 1024,
+    )
+    tts_long_threshold_chars: int = Field(
+        200,
+        description="Character threshold for 'long_only' TTS mode.",
+        ge=1,
+    )
     enable_quick_actions: bool = Field(True, description="Enable quick action buttons")
     agentic_mode: bool = Field(
         True,

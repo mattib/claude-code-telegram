@@ -326,6 +326,7 @@ class MessageOrchestrator:
             ("new", self.agentic_new),
             ("status", self.agentic_status),
             ("verbose", self.agentic_verbose),
+            ("voice", self.agentic_voice_cmd),
             ("repo", self.agentic_repo),
             ("restart", command.restart_command),
         ]
@@ -459,6 +460,7 @@ class MessageOrchestrator:
                 BotCommand("new", "Start a fresh session"),
                 BotCommand("status", "Show session status"),
                 BotCommand("verbose", "Set output verbosity (0/1/2)"),
+                BotCommand("voice", "Configure voice output (TTS)"),
                 BotCommand("repo", "List repos / switch workspace"),
                 BotCommand("restart", "Restart the bot"),
             ]
@@ -619,6 +621,364 @@ class MessageOrchestrator:
         labels = {0: "quiet", 1: "normal", 2: "detailed"}
         await update.message.reply_text(
             f"Verbosity set to <b>{level}</b> ({labels[level]})",
+            parse_mode="HTML",
+        )
+
+    # ------------------------------------------------------------------ /voice
+
+    # Short keys -> human-friendly labels for the menu/status output.
+    _TTS_VOICE_LABELS: Dict[str, str] = {
+        "hila": "Hila (female, soft)",
+        "avri": "Avri (male, friendly)",
+    }
+    _TTS_SPEED_MAP: Dict[str, str] = {"slow": "-15%", "normal": "0%", "fast": "+15%"}
+    _TTS_PITCH_MAP: Dict[str, str] = {"low": "-5Hz", "normal": "0Hz", "high": "+5Hz"}
+    _TTS_MODES: frozenset = frozenset({"always", "long_only", "on_request"})
+
+    async def _get_or_create_user_prefs(
+        self, context: ContextTypes.DEFAULT_TYPE, user_id: int, username: Optional[str]
+    ):
+        """Fetch the user row, creating a bare record on first touch."""
+        storage = context.bot_data.get("storage")
+        if storage is None:
+            return None
+        user = await storage.users.get_user(user_id)
+        if user is None:
+            from ..storage.models import UserModel
+
+            user = UserModel(
+                user_id=user_id,
+                telegram_username=username,
+                is_allowed=True,
+            )
+            try:
+                await storage.users.create_user(user)
+            except Exception as e:
+                logger.debug("User row upsert skipped", user_id=user_id, error=str(e))
+        return user
+
+    def _format_voice_status(self, user) -> str:
+        """Render a compact status string for /voice with no args."""
+        voice_label = self._TTS_VOICE_LABELS.get(user.tts_voice, user.tts_voice)
+        state = "on" if user.tts_enabled else "off"
+        return (
+            f"<b>Voice output: {state}</b>\n"
+            f"• Voice: {voice_label}\n"
+            f"• Speed: {user.tts_rate}\n"
+            f"• Pitch: {user.tts_pitch}\n"
+            f"• Mode: {user.tts_mode}\n\n"
+            "Usage:\n"
+            "  <code>/voice on</code> | <code>/voice off</code>\n"
+            "  <code>/voice hila</code> | <code>/voice avri</code>\n"
+            "  <code>/voice speed slow|normal|fast</code>\n"
+            "  <code>/voice pitch low|normal|high</code>\n"
+            "  <code>/voice mode always|long_only|on_request</code>\n"
+            "  <code>/voice test</code> — hear current settings\n"
+            "  <code>/voice reset</code> — restore defaults"
+        )
+
+    async def _send_voice_sample(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE, user
+    ) -> None:
+        """Generate a short sample using the user's current TTS prefs."""
+        if not self.settings.enable_tts_output:
+            await update.message.reply_text(
+                "Voice output is disabled at the bot level. "
+                "Ask an admin to enable <code>ENABLE_TTS_OUTPUT</code>.",
+                parse_mode="HTML",
+            )
+            return
+
+        from .features.tts_synthesizer import (
+            TTSRequest,
+            TTSSynthesisError,
+            TTSSynthesizer,
+            TTSUnavailableError,
+        )
+
+        sample_text = (
+            "שלום, זה דגימה של הקול שבחרת. "
+            "אפשר לשנות מהירות וגובה צליל עם פקודת הקול."
+        )
+        cache_dir = (
+            self.settings.tts_cache_dir
+            or Path(self.settings.approved_directory) / ".tts_cache"
+        )
+        synth = TTSSynthesizer(
+            cache_dir=cache_dir,
+            cache_max_bytes=self.settings.tts_cache_max_bytes,
+        )
+        try:
+            audio_path = await synth.synthesize(
+                TTSRequest(
+                    text=sample_text,
+                    voice=user.tts_voice,
+                    rate=user.tts_rate,
+                    pitch=user.tts_pitch,
+                )
+            )
+        except TTSUnavailableError:
+            await update.message.reply_text(
+                "TTS engine not installed. "
+                "Run <code>pip install edge-tts</code> on the bot host.",
+                parse_mode="HTML",
+            )
+            return
+        except TTSSynthesisError as e:
+            await update.message.reply_text(f"TTS failed: {str(e)[:200]}")
+            return
+
+        try:
+            with open(audio_path, "rb") as f:
+                await update.message.reply_voice(
+                    voice=f,
+                    caption=(
+                        f"Voice: {self._TTS_VOICE_LABELS.get(user.tts_voice)} · "
+                        f"rate {user.tts_rate} · pitch {user.tts_pitch}"
+                    ),
+                )
+        except Exception as send_err:
+            logger.warning("Failed to send TTS sample", error=str(send_err))
+            await update.message.reply_text(
+                f"Generated sample but couldn't send it: {send_err}"
+            )
+
+    async def _maybe_send_tts_reply(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        formatted_messages: List[Any],
+        user_id: int,
+    ) -> None:
+        """Speak the reply if the user has opted in and the mode allows it.
+
+        Called after text messages are delivered, so the text path is always
+        the source of truth and TTS is pure enhancement.
+        """
+        # Diagnostic (added 2026-04-21) — helps us see WHICH early-return path
+        # hits when a user expects voice but gets only text.
+        logger.info(
+            "TTS reply hook entered",
+            user_id=user_id,
+            enable_tts_output=self.settings.enable_tts_output,
+            num_formatted=len(formatted_messages) if formatted_messages else 0,
+        )
+
+        if not self.settings.enable_tts_output:
+            logger.info("TTS skip: enable_tts_output=False", user_id=user_id)
+            return
+
+        storage = context.bot_data.get("storage")
+        if storage is None:
+            logger.info("TTS skip: storage missing from bot_data", user_id=user_id)
+            return
+
+        user = await storage.users.get_user(user_id)
+        if user is None:
+            logger.info("TTS skip: user record not found", user_id=user_id)
+            return
+        if not user.tts_enabled:
+            logger.info("TTS skip: user.tts_enabled=False", user_id=user_id)
+            return
+        logger.info(
+            "TTS user prefs loaded",
+            user_id=user_id,
+            tts_enabled=user.tts_enabled,
+            tts_voice=user.tts_voice,
+            tts_mode=user.tts_mode,
+            tts_rate=user.tts_rate,
+            tts_pitch=user.tts_pitch,
+        )
+
+        # Flatten formatted messages to a single plain-text string. We strip
+        # HTML-ish tags crudely; edge-tts renders plain text best.
+        parts: List[str] = []
+        for msg in formatted_messages:
+            text = getattr(msg, "text", None)
+            if text:
+                parts.append(text)
+        reply_text = "\n\n".join(parts).strip()
+        if not reply_text:
+            logger.info(
+                "TTS skip: joined reply_text is empty",
+                user_id=user_id,
+                num_formatted=len(formatted_messages),
+            )
+            return
+
+        # Strip HTML tags we emit (<b>, <code>, etc.) for cleaner speech.
+        reply_text = re.sub(r"<[^>]+>", "", reply_text)
+
+        from .features.tts_synthesizer import (
+            TTSSynthesizer,
+            should_speak,
+            synthesize_for_user,
+        )
+
+        speak = should_speak(
+            reply_text,
+            user.tts_mode,
+            long_threshold=self.settings.tts_long_threshold_chars,
+        )
+        logger.info(
+            "TTS should_speak decision",
+            user_id=user_id,
+            speak=speak,
+            text_len=len(reply_text),
+            mode=user.tts_mode,
+            threshold=self.settings.tts_long_threshold_chars,
+        )
+        if not speak:
+            return
+
+        cache_dir = (
+            self.settings.tts_cache_dir
+            or Path(self.settings.approved_directory) / ".tts_cache"
+        )
+        synth = TTSSynthesizer(
+            cache_dir=cache_dir,
+            cache_max_bytes=self.settings.tts_cache_max_bytes,
+        )
+        audio_path = await synthesize_for_user(
+            synth,
+            reply_text,
+            voice=user.tts_voice,
+            rate=user.tts_rate,
+            pitch=user.tts_pitch,
+        )
+        if audio_path is None:
+            logger.warning(
+                "TTS synth returned None — voice reply skipped",
+                user_id=user_id,
+                text_len=len(reply_text),
+            )
+            return
+
+        try:
+            with open(audio_path, "rb") as f:
+                await update.message.reply_voice(voice=f)
+            logger.info(
+                "TTS voice reply sent",
+                user_id=user_id,
+                audio_bytes=audio_path.stat().st_size,
+            )
+        except Exception as send_err:
+            logger.warning(
+                "Failed to send TTS voice reply",
+                error=str(send_err),
+                error_type=type(send_err).__name__,
+            )
+
+    async def agentic_voice_cmd(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """/voice — per-user TTS preferences.
+
+        Distinct from ``agentic_voice`` which handles inbound voice *messages*
+        (speech-to-text). This handler configures outbound speech synthesis.
+        """
+        user_id = update.effective_user.id
+        username = update.effective_user.username
+
+        storage = context.bot_data.get("storage")
+        if storage is None:
+            await update.message.reply_text(
+                "User storage is unavailable; /voice can't persist changes."
+            )
+            return
+
+        user = await self._get_or_create_user_prefs(context, user_id, username)
+        if user is None:
+            await update.message.reply_text("Could not load your user record.")
+            return
+
+        args = update.message.text.split()[1:] if update.message.text else []
+        if not args:
+            await update.message.reply_text(
+                self._format_voice_status(user), parse_mode="HTML"
+            )
+            return
+
+        sub = args[0].lower()
+
+        if sub in ("on", "off"):
+            enabled = sub == "on"
+            if enabled and not self.settings.enable_tts_output:
+                await update.message.reply_text(
+                    "Voice output is globally disabled. "
+                    "Ask an admin to set <code>ENABLE_TTS_OUTPUT=true</code>.",
+                    parse_mode="HTML",
+                )
+                return
+            await storage.users.update_tts_prefs(user_id, enabled=enabled)
+            if enabled:
+                refreshed = await storage.users.get_user(user_id) or user
+                refreshed.tts_enabled = True
+                await update.message.reply_text(
+                    "Voice output enabled. Playing a sample...",
+                )
+                await self._send_voice_sample(update, context, refreshed)
+            else:
+                await update.message.reply_text("Voice output disabled.")
+            return
+
+        if sub in ("hila", "avri"):
+            await storage.users.update_tts_prefs(user_id, voice=sub)
+            await update.message.reply_text(
+                f"Voice set to <b>{self._TTS_VOICE_LABELS[sub]}</b>.",
+                parse_mode="HTML",
+            )
+            return
+
+        if sub == "speed":
+            if len(args) < 2 or args[1].lower() not in self._TTS_SPEED_MAP:
+                await update.message.reply_text(
+                    "Usage: <code>/voice speed slow|normal|fast</code>",
+                    parse_mode="HTML",
+                )
+                return
+            rate = self._TTS_SPEED_MAP[args[1].lower()]
+            await storage.users.update_tts_prefs(user_id, rate=rate)
+            await update.message.reply_text(f"Speed set to {args[1].lower()} ({rate}).")
+            return
+
+        if sub == "pitch":
+            if len(args) < 2 or args[1].lower() not in self._TTS_PITCH_MAP:
+                await update.message.reply_text(
+                    "Usage: <code>/voice pitch low|normal|high</code>",
+                    parse_mode="HTML",
+                )
+                return
+            pitch = self._TTS_PITCH_MAP[args[1].lower()]
+            await storage.users.update_tts_prefs(user_id, pitch=pitch)
+            await update.message.reply_text(f"Pitch set to {args[1].lower()} ({pitch}).")
+            return
+
+        if sub == "mode":
+            if len(args) < 2 or args[1].lower() not in self._TTS_MODES:
+                await update.message.reply_text(
+                    "Usage: <code>/voice mode always|long_only|on_request</code>",
+                    parse_mode="HTML",
+                )
+                return
+            mode = args[1].lower()
+            await storage.users.update_tts_prefs(user_id, mode=mode)
+            await update.message.reply_text(
+                f"Mode set to <b>{mode}</b>.", parse_mode="HTML"
+            )
+            return
+
+        if sub == "test":
+            await self._send_voice_sample(update, context, user)
+            return
+
+        if sub == "reset":
+            await storage.users.reset_tts_prefs(user_id)
+            await update.message.reply_text("Voice preferences reset to defaults.")
+            return
+
+        await update.message.reply_text(
+            "Unknown /voice subcommand. Send <code>/voice</code> for usage.",
             parse_mode="HTML",
         )
 
@@ -1149,6 +1509,21 @@ class MessageOrchestrator:
                 except Exception as img_err:
                     logger.warning("Image send failed", error=str(img_err))
 
+        # Optional TTS voice-out of the reply (per-user opt-in, best-effort).
+        # Never blocks delivery; failures are logged and swallowed.
+        try:
+            await self._maybe_send_tts_reply(
+                update, context, formatted_messages, user_id
+            )
+        except Exception as tts_err:  # pragma: no cover - defensive
+            # Upgraded from debug → warning 2026-04-21 so silent failures surface.
+            logger.warning(
+                "TTS reply hook failed",
+                error=str(tts_err),
+                error_type=type(tts_err).__name__,
+                user_id=user_id,
+            )
+
         # Audit log
         audit_logger = context.bot_data.get("audit_logger")
         if audit_logger:
@@ -1539,6 +1914,22 @@ class MessageOrchestrator:
                     )
                 except Exception as img_err:
                     logger.warning("Image send failed", error=str(img_err))
+
+        # Optional TTS voice-out of the reply (per-user opt-in, best-effort).
+        # Shared media path serves both agentic_voice and agentic_image; both
+        # should auto-voice the reply when the user has /voice on, not just
+        # agentic_text. Fix 2026-04-21 — Matti reported voice-in → text-only-out.
+        try:
+            await self._maybe_send_tts_reply(
+                update, context, formatted_messages, user_id
+            )
+        except Exception as tts_err:  # pragma: no cover - defensive
+            logger.warning(
+                "TTS reply hook failed (media path)",
+                error=str(tts_err),
+                error_type=type(tts_err).__name__,
+                user_id=user_id,
+            )
 
     async def _handle_unknown_command(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
