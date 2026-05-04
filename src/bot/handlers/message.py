@@ -1,6 +1,7 @@
 """Message handlers for non-command inputs."""
 
 import asyncio
+import re
 from typing import Optional
 
 import structlog
@@ -308,6 +309,65 @@ async def handle_text_message(
     logger.info(
         "Processing text message", user_id=user_id, message_length=len(message_text)
     )
+
+    # ── Proposal interceptor ────────────────────────────────────────────────
+    # Matches: YES 3  /  NO 3  /  ASK 3 Why is this needed?
+    _proposal_re = re.match(
+        r"^(YES|NO|ASK)\s+(\d+)(?:\s+(.+))?$",
+        message_text.strip(),
+        re.IGNORECASE,
+    )
+    if _proposal_re:
+        _p_action = _proposal_re.group(1).upper()
+        _p_id = int(_proposal_re.group(2))
+        _p_question = (_proposal_re.group(3) or "").strip()
+
+        if _p_action in ("YES", "NO"):
+            # Handle locally — don't touch Claude
+            _proc = await asyncio.create_subprocess_exec(
+                "/home/tether/.local/bin/tether-proposals.py",
+                "respond", _p_action.lower(), str(_p_id),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+            _stdout, _ = await asyncio.wait_for(_proc.communicate(), timeout=30)
+            logger.info("Proposal response handled", action=_p_action, proposal_id=_p_id)
+            if _proc.returncode not in (0, None):
+                await update.message.reply_text(
+                    f"⚠️ Proposal response issue (rc={_proc.returncode}).\n"
+                    + (_stdout.decode(errors="replace") if _stdout else "")
+                )
+            return  # Don't send to Claude
+
+        elif _p_action == "ASK":
+            # Run the respond command (exits 2 to signal Claude pass-through)
+            _proc = await asyncio.create_subprocess_exec(
+                "/home/tether/.local/bin/tether-proposals.py",
+                "respond", "ask", str(_p_id), _p_question,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+            await asyncio.wait_for(_proc.communicate(), timeout=15)
+            # Inject proposal context into the message for Claude
+            import json as _json
+            import os as _os
+            _ctx_path = "/tmp/tether-proposal-ask.json"
+            if _os.path.exists(_ctx_path):
+                try:
+                    _ctx = _json.loads(open(_ctx_path).read())
+                    _p = _ctx["proposal"]
+                    message_text = (
+                        f"[PROPOSAL #{_p['id']}] {_p['title']}\n"
+                        f"Description: {_p['description']}\n"
+                        f"Proposed action: {_p['action']}\n\n"
+                        f"Matti's question: {_ctx['question']}\n\n"
+                        f"Please answer Matti's question about this proposal. "
+                        f"Be concise and direct."
+                    )
+                except Exception:
+                    message_text = f"About proposal #{_p_id}: {_p_question}"
+            # Fall through to Claude with updated message_text
+    # ── End proposal interceptor ────────────────────────────────────────────
 
     try:
         # Check rate limit with estimated cost for text processing
