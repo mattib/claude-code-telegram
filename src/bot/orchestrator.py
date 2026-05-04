@@ -749,11 +749,15 @@ class MessageOrchestrator:
         context: ContextTypes.DEFAULT_TYPE,
         formatted_messages: List[Any],
         user_id: int,
+        voice_input: bool = False,
     ) -> None:
         """Speak the reply if the user has opted in and the mode allows it.
 
         Called after text messages are delivered, so the text path is always
         the source of truth and TTS is pure enhancement.
+
+        voice_input=True bypasses mode/length threshold — when the user spoke
+        to us, we always speak back regardless of reply length.
         """
         # Diagnostic (added 2026-04-21) — helps us see WHICH early-return path
         # hits when a user expects voice but gets only text.
@@ -815,19 +819,31 @@ class MessageOrchestrator:
             synthesize_for_user,
         )
 
-        speak = should_speak(
-            reply_text,
-            user.tts_mode,
-            long_threshold=self.settings.tts_long_threshold_chars,
-        )
-        logger.info(
-            "TTS should_speak decision",
-            user_id=user_id,
-            speak=speak,
-            text_len=len(reply_text),
-            mode=user.tts_mode,
-            threshold=self.settings.tts_long_threshold_chars,
-        )
+        # Voice input always gets voice output — don't check mode/threshold.
+        if voice_input:
+            speak = True
+            logger.info(
+                "TTS should_speak decision",
+                user_id=user_id,
+                speak=True,
+                text_len=len(reply_text),
+                mode="forced_voice_input",
+                threshold=0,
+            )
+        else:
+            speak = should_speak(
+                reply_text,
+                user.tts_mode,
+                long_threshold=self.settings.tts_long_threshold_chars,
+            )
+            logger.info(
+                "TTS should_speak decision",
+                user_id=user_id,
+                speak=speak,
+                text_len=len(reply_text),
+                mode=user.tts_mode,
+                threshold=self.settings.tts_long_threshold_chars,
+            )
         if not speak:
             return
 
@@ -1792,6 +1808,7 @@ class MessageOrchestrator:
                 progress_msg=progress_msg,
                 user_id=user_id,
                 chat=chat,
+                voice_input=True,
             )
 
         except Exception as e:
@@ -1812,6 +1829,7 @@ class MessageOrchestrator:
         user_id: int,
         chat: Any,
         images: Optional[List[Dict[str, str]]] = None,
+        voice_input: bool = False,
     ) -> None:
         """Run a media-derived prompt through Claude and send responses."""
         claude_integration = context.bot_data.get("claude_integration")
@@ -1919,9 +1937,11 @@ class MessageOrchestrator:
         # Shared media path serves both agentic_voice and agentic_image; both
         # should auto-voice the reply when the user has /voice on, not just
         # agentic_text. Fix 2026-04-21 — Matti reported voice-in → text-only-out.
+        # voice_input=True bypasses length threshold — voice in → voice out always.
         try:
             await self._maybe_send_tts_reply(
-                update, context, formatted_messages, user_id
+                update, context, formatted_messages, user_id,
+                voice_input=voice_input,
             )
         except Exception as tts_err:  # pragma: no cover - defensive
             logger.warning(
