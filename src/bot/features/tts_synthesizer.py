@@ -104,7 +104,10 @@ def split_by_language(text: str, default_lang: str = "he") -> List[Tuple[str, st
         heb = len(_HEBREW_RE.findall(sentence))
         lat = len(_LATIN_RE.findall(sentence))
         if heb == 0 and lat == 0:
-            lang = default_lang
+            # No letters at all (pure punctuation, dashes, numbers, etc.) —
+            # not speakable and may confuse edge-tts arg parsing (e.g. "---"
+            # is misread as the argparse end-of-options marker). Drop it.
+            continue
         elif heb == 0:
             lang = "en"
         elif lat == 0:
